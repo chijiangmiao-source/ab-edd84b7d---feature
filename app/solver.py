@@ -457,8 +457,14 @@ def _first_unstable_relation(node_ids, idx, counters, modulus, dist, wraps1, wra
 # main entry point
 # ---------------------------------------------------------------------------
 
-def solve(norm):
-    """Solve a normalized request; returns {status, conclusion, evidence}."""
+def build_model(norm):
+    """Turn a normalized request into the integer difference-constraint model.
+
+    Returns the node labeling, counter residues and every wrap-count edge
+    (shortest-path form ``x_v - x_u <= w``) plus the per-constraint integer
+    bound derivation.  ``solve`` and the adaptive query planner both build on
+    the same frozen model so their evidence always agrees.
+    """
     modulus = norm["modulus"]
     anchor = norm["anchor"]
     events = norm["events"]
@@ -514,6 +520,38 @@ def solve(norm):
             "relation": f"wrap({c.target}) - wrap({c.source}) in [{lo_k}, {hi_k}]",
         })
 
+    return {
+        "n": n,
+        "edges": edges,
+        "labels": labels,
+        "node_ids": node_ids,
+        "idx": idx,
+        "counters": counters,
+        "modulus": modulus,
+        "anchor_id": anchor_id,
+        "anchor_absolute": anchor["absolute"],
+        "anchor_wrap": anchor_wrap,
+        "events": events,
+        "derivation": derivation,
+    }
+
+
+def solve(norm):
+    """Solve a normalized request; returns {status, conclusion, evidence}."""
+    model = build_model(norm)
+    n = model["n"]
+    edges = model["edges"]
+    labels = model["labels"]
+    node_ids = model["node_ids"]
+    idx = model["idx"]
+    counters = model["counters"]
+    modulus = model["modulus"]
+    anchor_id = model["anchor_id"]
+    anchor_absolute = model["anchor_absolute"]
+    anchor_wrap = model["anchor_wrap"]
+    events = model["events"]
+    derivation = model["derivation"]
+
     dist = _floyd_warshall(n, edges)
     if _infeasible(dist):
         return {
@@ -538,7 +576,7 @@ def solve(norm):
     evidence = {
         "derivation": derivation,
         "node_ranges": node_ranges,
-        "anchor": {"id": anchor_id, "absolute": anchor["absolute"], "wrap": anchor_wrap},
+        "anchor": {"id": anchor_id, "absolute": anchor_absolute, "wrap": anchor_wrap},
     }
 
     if all(r["min_wrap"] == r["max_wrap"] for r in node_ranges):

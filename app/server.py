@@ -1,10 +1,13 @@
 """HTTP API for the deep-space timestamp audit service (stdlib only).
 
 Endpoints:
-    GET  /health          liveness probe
-    POST /audits          create an audit (idempotent on request_id)
-    GET  /audits          list audit ids
-    GET  /audits/{id}     read the frozen input, conclusion and evidence
+    GET  /health                       liveness probe
+    POST /audits                       create an audit (idempotent on request_id)
+    GET  /audits                       list audit ids
+    GET  /audits/{id}                  read the frozen input, conclusion and evidence
+    POST /audits/{id}/plans            open an adaptive query plan on an audit
+    GET  /audits/{id}/plans            list plan refs under one audit
+    GET  /plans/{ref}                  read a frozen plan with its source audit
 """
 
 from __future__ import annotations
@@ -16,9 +19,13 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
 from .solver import InputError
-from .store import AuditStore, ConflictError
+from .store import AuditStore, ConflictError, PlanConflictError
+from .planner import SourceNotAmbiguousError
 
 _AUDIT_PATH = re.compile(r"^/audits/([A-Za-z0-9][A-Za-z0-9_-]*)$")
+_PLAN_COLLECTION_PATH = re.compile(
+    r"^/audits/([A-Za-z0-9][A-Za-z0-9_-]*)/plans$")
+_PLAN_PATH = re.compile(r"^/plans/([A-Za-z0-9][A-Za-z0-9_-]*)$")
 
 
 class _BadBody(Exception):
@@ -73,10 +80,36 @@ class Handler(BaseHTTPRequestHandler):
                     "message": f"no audit {match.group(1)}",
                 })
             return self._send_json(200, record)
+        plans_match = _PLAN_COLLECTION_PATH.match(path)
+        if plans_match:
+            audit_id = plans_match.group(1)
+            record = self.store.get(audit_id)
+            if record is None:
+                return self._send_json(404, {
+                    "error": "not_found",
+                    "message": f"no audit {audit_id}",
+                })
+            return self._send_json(200, {
+                "audit_id": audit_id,
+                "plans": self.store.plan_refs_for(audit_id),
+                "count": len(self.store.plan_refs_for(audit_id)),
+            })
+        plan_match = _PLAN_PATH.match(path)
+        if plan_match:
+            bundle = self.store.plan_with_source(plan_match.group(1))
+            if bundle is None:
+                return self._send_json(404, {
+                    "error": "not_found",
+                    "message": f"no plan {plan_match.group(1)}",
+                })
+            return self._send_json(200, bundle)
         return self._send_json(404, {"error": "not_found"})
 
     def do_POST(self):
         path = urlparse(self.path).path.rstrip("/") or "/"
+        plans_match = _PLAN_COLLECTION_PATH.match(path)
+        if plans_match:
+            return self._create_plan(plans_match.group(1))
         if path != "/audits":
             return self._send_json(404, {"error": "not_found"})
         try:
@@ -101,6 +134,43 @@ class Handler(BaseHTTPRequestHandler):
                 "existing_audit_id": exc.audit_id,
             })
         body = dict(record)
+        body["replayed"] = not created
+        return self._send_json(201 if created else 200, body)
+
+    def _create_plan(self, audit_id):
+        if self.store.get(audit_id) is None:
+            return self._send_json(404, {
+                "error": "not_found",
+                "message": f"no audit {audit_id}",
+            })
+        try:
+            payload = self._read_json()
+        except _BadBody:
+            return self._send_json(400, {
+                "error": "bad_json",
+                "message": "request body is not valid JSON",
+            })
+        try:
+            plan_record, created = self.store.create_plan(audit_id, payload)
+        except InputError as exc:
+            return self._send_json(400, {
+                "error": "invalid_input",
+                "problems": exc.problems,
+            })
+        except SourceNotAmbiguousError as exc:
+            return self._send_json(409, {
+                "error": "source_not_ambiguous",
+                "message": "plans may only be opened on ambiguous audits",
+                "source_status": exc.status,
+            })
+        except PlanConflictError as exc:
+            return self._send_json(409, {
+                "error": "plan_id_conflict",
+                "message": "plan_id was already used with different content; "
+                           "no plan was added",
+                "existing_plan_ref": exc.plan_ref,
+            })
+        body = dict(plan_record)
         body["replayed"] = not created
         return self._send_json(201 if created else 200, body)
 

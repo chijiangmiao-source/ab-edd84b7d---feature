@@ -6,7 +6,9 @@ Runs three gates and reports the outcome through the process exit code:
 2. code tests  -- the unit-test suite (solver, store, API);
 3. API smoke   -- HTTP checks against a live service at APP_URL covering the
    reference unwrap (B=103), the ambiguous twin timelines, the bidirectional
-   conflict chain, and idempotent record creation.
+   conflict chain, idempotent record creation, and adaptive on-site query
+   plans (reachable branches, impossible-answer pruning, the shortest
+   canonical plan and the indistinguishable-case counterexample).
 
 Exit code 0 means every check passed.
 """
@@ -110,6 +112,37 @@ CONFLICT_PAYLOAD = {
     "constraints": [
         {"id": "c1", "source": "A", "target": "B", "lo": 8, "hi": 8},
         {"id": "c2", "source": "B", "target": "A", "lo": -108, "hi": -108},
+    ],
+}
+
+PLAN_AMBIG_PAYLOAD = {
+    "request_id": "smoke-plan-ambig",
+    "modulus": 100,
+    "anchor": {"id": "A", "absolute": 95},
+    "events": [{"id": "B", "counter": 3}, {"id": "C", "counter": 50}],
+    "constraints": [
+        {"id": "c1", "source": "A", "target": "B", "lo": 8, "hi": 108},
+        {"id": "c2", "source": "B", "target": "C", "lo": -53, "hi": 47},
+    ],
+}
+
+# Three same-residue events (wraps 0..1): every before/same/after answer is
+# live for any pair, and two chained indirect queries are needed adaptively.
+PLAN_ADAPTIVE_PAYLOAD = {
+    "request_id": "smoke-plan-adaptive",
+    "modulus": 10,
+    "anchor": {"id": "A", "absolute": 0},
+    "events": [
+        {"id": "X", "counter": 5},
+        {"id": "Y", "counter": 5},
+        {"id": "Z", "counter": 5},
+    ],
+    "constraints": [
+        {"id": "a-x", "source": "A", "target": "X", "lo": 5, "hi": 15},
+        {"id": "a-y", "source": "A", "target": "Y", "lo": 5, "hi": 15},
+        {"id": "a-z", "source": "A", "target": "Z", "lo": 5, "hi": 15},
+        {"id": "x-z", "source": "X", "target": "Z", "lo": -10, "hi": 10},
+        {"id": "z-y", "source": "Z", "target": "Y", "lo": -10, "hi": 10},
     ],
 }
 
@@ -236,6 +269,212 @@ def smoke_validation_and_404():
     expect(status == 404, f"unknown audit returned {status}")
 
 
+# ---------------------------------------------------------------------------
+# adaptive query plans
+# ---------------------------------------------------------------------------
+
+def _tree_leaves(tree, out=None):
+    if out is None:
+        out = []
+    if tree["type"] == "internal":
+        for child in tree["answers"].values():
+            if child is not None:
+                _tree_leaves(child, out)
+    else:
+        out.append(tree)
+    return out
+
+
+def _max_depth(tree, depth=0):
+    if tree["type"] != "internal":
+        return depth
+    return max(_max_depth(c, depth + 1)
+               for c in tree["answers"].values() if c is not None)
+
+
+def _follow(tree, answers):
+    node = tree
+    for answer in answers:
+        node = node["answers"][answer]
+    return node
+
+
+def smoke_plan_reachable_branches_and_pruning():
+    status, audit = request("POST", "/audits", PLAN_AMBIG_PAYLOAD)
+    expect(status == 201, f"create audit returned {status}: {audit}")
+    expect(audit["status"] == "ambiguous", "source must be ambiguous")
+    path = f"/audits/{audit['audit_id']}/plans"
+    body = {
+        "plan_id": "smoke-plan-direct",
+        "target": ["A", "C"],
+        "queries": [{"id": "q-ac", "left": "A", "right": "C"}],
+    }
+    status, plan = request("POST", path, body)
+    expect(status == 201, f"create plan returned {status}: {plan}")
+    expect(plan["status"] == "resolved", f"plan status {plan['status']}")
+    expect(plan["worst_case_questions"] == 1,
+           f"worst case {plan['worst_case_questions']}")
+    tree = plan["tree"]
+    expect(tree["ask"] == "q-ac", "root must ask the only candidate")
+    expect(set(tree["reachable_answers"]) == {"before", "after"},
+           f"reachable answers: {tree['reachable_answers']}")
+    # residues 95 vs 50: the device can never answer "same tick"
+    expect(tree["answers"]["same"] is None, "same answer must be pruned")
+    expect("same" in tree["impossible_answers"], "same must be listed pruned")
+    leaves = _tree_leaves(tree)
+    expect(len(leaves) == 2, f"expected 2 reachable leaves, got {len(leaves)}")
+    expect({leaf["target_relation"] for leaf in leaves}
+           == {"before", "after"}, "leaves must pin the target uniquely")
+    # the imposed integer bounds are part of the frozen evidence
+    bounds = tree["answers"]["before"]["answer_path"][0]["imposed_bounds"]
+    expect(bounds and "wrap(C) - wrap(A) >=" in bounds[0], f"bounds: {bounds}")
+
+
+def smoke_plan_shortest_adaptive_tree():
+    status, audit = request("POST", "/audits", PLAN_ADAPTIVE_PAYLOAD)
+    expect(status == 201, f"create audit returned {status}")
+    path = f"/audits/{audit['audit_id']}/plans"
+    body = {
+        "plan_id": "smoke-plan-adaptive-1",
+        "target": ["X", "Y"],
+        "queries": [
+            {"id": "q-xz", "left": "X", "right": "Z"},
+            {"id": "q-zy", "left": "Z", "right": "Y"},
+        ],
+    }
+    status, plan = request("POST", path, body)
+    expect(status == 201, f"create plan returned {status}: {plan}")
+    expect(plan["worst_case_questions"] == 2,
+           f"one indirect query cannot settle the target; worst case must be "
+           f"2, got {plan['worst_case_questions']}")
+    tree = plan["tree"]
+    # tie in worst case broken by candidate identifier order
+    expect(tree["ask"] == "q-xz",
+           f"identifier tie-break expected q-xz, got {tree['ask']}")
+    expect(set(tree["reachable_answers"]) == {"before", "same", "after"},
+           "all three answers must be reachable at the root")
+    # wraps in {0,1}: two same-direction strict steps would need wrap 2,
+    # so those second answers are impossible and must be pruned
+    expect(_follow(tree, ["before", "before"]) is None,
+           "before/before must be an impossible path")
+    expect(_follow(tree, ["after", "after"]) is None,
+           "after/after must be an impossible path")
+    expect(_max_depth(tree) == 2, "tree must terminate within two questions")
+    for leaf in _tree_leaves(tree):
+        expect(leaf["type"] == "leaf", "reachable endpoint must be a leaf")
+        expect(leaf["target_relation"] in ("before", "same", "after"),
+               "every leaf must state a unique target relation")
+    # before -> same settles it: k_X=0,k_Z=1,k_Y=1, X before Y
+    node = _follow(tree, ["before", "same"])
+    expect(node is not None and node["type"] == "leaf"
+           and node["target_relation"] == "before",
+           "before/same must resolve to X before Y")
+
+
+def smoke_plan_failure_counterexample():
+    payload = dict(PLAN_AMBIG_PAYLOAD, request_id="smoke-plan-fail-src")
+    status, audit = request("POST", "/audits", payload)
+    expect(status in (200, 201), f"create audit returned {status}")
+    path = f"/audits/{audit['audit_id']}/plans"
+    body = {
+        "plan_id": "smoke-plan-fail",
+        "target": ["A", "C"],
+        "queries": [{"id": "only-ab", "left": "A", "right": "B"}],
+    }
+    status, plan = request("POST", path, body)
+    expect(status == 201, f"create plan returned {status}: {plan}")
+    expect(plan["status"] == "indistinguishable",
+           f"asking only about A/B cannot separate C: {plan['status']}")
+    expect(plan["tree"] is None, "indistinguishable plan carries no tree")
+    ce = plan["counterexample"]
+    expect(ce is not None, "a failure witness is mandatory")
+    t1, t2 = ce["timeline_1"], ce["timeline_2"]
+    expect(t1["target_relation"] != t2["target_relation"],
+           "witness timelines must disagree on the target")
+    abs1 = {e["id"]: e["absolute"] for e in t1["events"]}
+    abs2 = {e["id"]: e["absolute"] for e in t2["events"]}
+    expect(abs1["A"] == abs2["A"] == 95, "anchor must stay fixed")
+    expect(abs1["B"] == abs2["B"] == 103,
+           "the observed A/B answer must hold on both timelines")
+    expect(abs1["C"] != abs2["C"], "C must differ between the timelines")
+    expect(ce["answer_path"], "the indistinguishable path must be concrete")
+    for step in ce["answer_replay"]:
+        expect(step["timeline_1_answer"] == step["expected_answer"]
+               == step["timeline_2_answer"],
+               f"answer {step['query']} must replay identically on both "
+               f"timelines: {step}")
+    # both witness timelines must independently satisfy the frozen constraints
+    for timeline in (t1["events"], t2["events"]):
+        tick = {e["id"]: e["absolute"] for e in timeline}
+        for c in PLAN_AMBIG_PAYLOAD["constraints"]:
+            delta = tick[c["target"]] - tick[c["source"]]
+            expect(c["lo"] <= delta <= c["hi"],
+                   f"witness timeline violates {c['id']}: {delta}")
+
+
+def smoke_plan_rejections_and_readback():
+    fresh = dict(PLAN_AMBIG_PAYLOAD, request_id="smoke-plan-rej-src")
+    _, ambig = request("POST", "/audits", fresh)
+    _, unique = request("POST", "/audits", UNIQUE_PAYLOAD)
+
+    # source audit not ambiguous
+    status, body = request(
+        "POST", f"/audits/{unique['audit_id']}/plans", {
+            "plan_id": "rej-status", "target": ["A", "B"], "queries": []})
+    expect(status == 409, f"non-ambiguous source returned {status}")
+    expect(body.get("error") == "source_not_ambiguous", f"body: {body}")
+
+    path = f"/audits/{ambig['audit_id']}/plans"
+    # unknown target / query events
+    status, body = request("POST", path, {
+        "plan_id": "rej-target", "target": ["A", "ZZ"], "queries": []})
+    expect(status == 400, f"unknown target returned {status}")
+    expect(any("does not exist" in p for p in body.get("problems", [])),
+          f"problems: {body}")
+    status, body = request("POST", path, {
+        "plan_id": "rej-pair", "target": ["A", "C"],
+        "queries": [
+            {"id": "q1", "left": "A", "right": "C"},
+            {"id": "q2", "left": "C", "right": "A"},
+        ]})
+    expect(status == 400, f"duplicate pair returned {status}")
+    expect(any("event pair" in p for p in body.get("problems", [])),
+          f"problems: {body}")
+    # nothing half-written: no plans exist under the audit yet
+    status, listing = request("GET", path)
+    expect(listing["count"] == 0,
+           f"rejected requests must not write plans: {listing}")
+
+    status, first = request("POST", path, {
+        "plan_id": "rej-idem", "target": ["A", "C"],
+        "queries": [{"id": "q1", "left": "A", "right": "C"}]})
+    expect(status == 201, f"create returned {status}")
+    # same id, changed content
+    status, body = request("POST", path, {
+        "plan_id": "rej-idem", "target": ["B", "C"], "queries": []})
+    expect(status == 409, f"changed plan content returned {status}")
+    expect(body.get("existing_plan_ref") == first["plan_ref"],
+           f"409 must reference the existing plan: {body}")
+    status, listing = request("GET", path)
+    expect(listing["count"] == 1, f"conflict must not add a plan: {listing}")
+
+    # read the plan together with the frozen source audit evidence
+    status, bundle = request("GET", f"/plans/{first['plan_ref']}")
+    expect(status == 200, f"plan readback returned {status}")
+    expect(bundle["plan"]["plan_ref"] == first["plan_ref"], "plan ref mismatch")
+    expect(bundle["source_audit"]["audit_id"] == ambig["audit_id"],
+           "readback must embed the source audit")
+    expect(bundle["source_audit"]["conclusion"]["timelines"]
+           == ambig["conclusion"]["timelines"],
+           "frozen source evidence (twin timelines) must be preserved")
+    expect(bundle["source_audit"]["conclusion"]["first_unstable_relation"]
+           == ambig["conclusion"]["first_unstable_relation"],
+           "frozen source evidence (unstable relation) must be preserved")
+    status, _ = request("GET", "/plans/PLN-999999")
+    expect(status == 404, f"unknown plan returned {status}")
+
+
+
 def gate_http():
     if not wait_ready():
         check("http: service reachable", False, f"no /health from {APP_URL}")
@@ -249,6 +488,14 @@ def gate_http():
         ("http: bidirectional conflict chain", smoke_conflict_chain),
         ("http: idempotent records", smoke_idempotency),
         ("http: validation and 404", smoke_validation_and_404),
+        ("http: plan reachable branches and pruned answers",
+         smoke_plan_reachable_branches_and_pruning),
+        ("http: shortest canonical adaptive plan",
+         smoke_plan_shortest_adaptive_tree),
+        ("http: indistinguishable plan returns counterexample",
+         smoke_plan_failure_counterexample),
+        ("http: plan rejections and frozen readback",
+         smoke_plan_rejections_and_readback),
     ]
     for name, fn in smokes:
         try:
