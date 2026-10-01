@@ -457,8 +457,11 @@ def _first_unstable_relation(node_ids, idx, counters, modulus, dist, wraps1, wra
 # main entry point
 # ---------------------------------------------------------------------------
 
-def solve(norm):
-    """Solve a normalized request; returns {status, conclusion, evidence}."""
+def build_system(norm):
+    """Build the frozen integer difference-constraint graph for a normalized
+    request.  Returns every piece needed to solve it once or to branch it many
+    times (the adaptive planner reuses exactly these base edges).
+    """
     modulus = norm["modulus"]
     anchor = norm["anchor"]
     events = norm["events"]
@@ -514,6 +517,36 @@ def solve(norm):
             "relation": f"wrap({c.target}) - wrap({c.source}) in [{lo_k}, {hi_k}]",
         })
 
+    return {
+        "modulus": modulus,
+        "anchor_id": anchor_id,
+        "anchor_wrap": anchor_wrap,
+        "node_ids": node_ids,
+        "idx": idx,
+        "labels": labels,
+        "n": n,
+        "counters": counters,
+        "events": events,
+        "edges": edges,
+        "derivation": derivation,
+    }
+
+
+def solve(norm):
+    """Solve a normalized request; returns {status, conclusion, evidence}."""
+    system = build_system(norm)
+    modulus = system["modulus"]
+    anchor_id = system["anchor_id"]
+    anchor_wrap = system["anchor_wrap"]
+    node_ids = system["node_ids"]
+    idx = system["idx"]
+    labels = system["labels"]
+    n = system["n"]
+    counters = system["counters"]
+    events = system["events"]
+    edges = system["edges"]
+    derivation = system["derivation"]
+
     dist = _floyd_warshall(n, edges)
     if _infeasible(dist):
         return {
@@ -538,7 +571,9 @@ def solve(norm):
     evidence = {
         "derivation": derivation,
         "node_ranges": node_ranges,
-        "anchor": {"id": anchor_id, "absolute": anchor["absolute"], "wrap": anchor_wrap},
+        "anchor": {"id": anchor_id,
+                   "absolute": norm["anchor"]["absolute"],
+                   "wrap": anchor_wrap},
     }
 
     if all(r["min_wrap"] == r["max_wrap"] for r in node_ranges):
